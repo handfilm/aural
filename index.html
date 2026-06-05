@@ -2663,17 +2663,14 @@ function clearSession(){
    Cross-device: export/import JSON vault manually, or use GAS sync
    ════════════════════════════════════════════════════════════════ */
 
-const USERS_KEY = 'aural_users_v1'; // localStorage key for user registry
-
-/* ── Load/save user registry from localStorage ── */
-function loadUsers(){
-  try{ return JSON.parse(localStorage.getItem(USERS_KEY)||'{}'); }
-  catch(_){ return {}; }
-}
-function saveUsers(users){
-  try{ localStorage.setItem(USERS_KEY, JSON.stringify(users)); }
-  catch(_){}
-}
+/* ════════════════════════════════════════════════════════════════
+   AUTH ENGINE v3 — Deterministic, cross-device, zero-server
+   ─────────────────────────────────────────────────────────────
+   KEY INSIGHT: userId = sha256(email+passwordHash)
+   Same email+password → same userId → same vault on ANY device
+   No server sync needed for auth. Works offline. Works cross-device.
+   Users also cached in IDB for "remember me" session.
+   ════════════════════════════════════════════════════════════════ */
 
 /* ── GAS call for track sync (no-cors, fire-and-forget) ── */
 async function gasCall(payload){
@@ -2686,47 +2683,104 @@ async function gasCall(payload){
   }catch(_){ /* silently fail — sync is optional */ }
 }
 
-/* ── Register new user (localStorage) ── */
+/* ── Register: just validates and returns deterministic user object ── */
 async function authRegister(name, email, password){
   if(!name||!email||!password) throw new Error('ALL FIELDS REQUIRED');
   if(password.length<6)        throw new Error('PASSWORD MIN 6 CHARS');
-  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('INVALID EMAIL');
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('INVALID EMAIL FORMAT');
 
-  const users = loadUsers();
-  const key   = email.trim().toLowerCase();
+  const key  = email.trim().toLowerCase();
+  const hash = await sha256(password + key);           // password hash
+  const id   = (await sha256(key + hash)).substring(0,16); // deterministic ID
 
-  if(users[key]) throw new Error('EMAIL ALREADY REGISTERED');
-
-  const hash = await sha256(password + key);
-  const id   = await sha256(key + Date.now());
-
-  users[key] = {
-    id:        id.substring(0,16),
-    name:      name.trim().toUpperCase(),
-    email:     key,
-    hash,
-    created:   Date.now(),
+  const user = {
+    id,
+    name:    name.trim().toUpperCase(),
+    email:   key,
+    hash,                    // stored for local verification on this device
+    created: Date.now(),
   };
-  saveUsers(users);
 
-  return { id: users[key].id, name: users[key].name, email: key };
+  // Cache in IDB so login works offline on this device without re-typing
+  await DB.setState('user_' + key, user);
+  return { id, name: user.name, email: key };
 }
 
-/* ── Login existing user (localStorage) ── */
+/* ── Login: deterministic — same credentials = same userId always ── */
 async function authLogin(email, password){
   if(!email||!password) throw new Error('EMAIL AND PASSWORD REQUIRED');
 
-  const users = loadUsers();
-  const key   = email.trim().toLowerCase();
-  const user  = users[key];
-
-  if(!user) throw new Error('NO ACCOUNT WITH THIS EMAIL');
-
+  const key  = email.trim().toLowerCase();
   const hash = await sha256(password + key);
-  if(hash !== user.hash) throw new Error('WRONG PASSWORD');
+  const id   = (await sha256(key + hash)).substring(0,16);
 
-  return { id: user.id, name: user.name, email: key };
+  // Check IDB cache first (works offline)
+  const cached = await DB.getState('user_' + key);
+
+  if(cached){
+    // Verify password matches cached hash
+    if(cached.hash !== hash) throw new Error('WRONG PASSWORD');
+    return { id: cached.id, name: cached.name, email: key };
+  }
+
+  // No cache on this device — new device login
+  // We can't verify password without a server, so we trust it
+  // and create a local session. The userId is always the same
+  // for the same credentials, so the vault will be correct.
+  // Store in IDB for future offline use.
+  const user = {
+    id, name: key.split('@')[0].toUpperCase(),
+    email: key, hash, created: Date.now(),
+  };
+  await DB.setState('user_' + key, user);
+  return { id, name: user.name, email: key };
 }
+
+/* ── Pull cloud tracks (optional — works if GAS is deployed) ── */
+async function pullCloudTracks(){
+  if(!currentUser) return;
+  setStatus('PULLING FROM CLOUD...','busy');
+  try{
+    const url = new URL(CONFIG.GAS_ENDPOINT);
+    url.searchParams.set('action','getAll');
+    url.searchParams.set('userId', currentUser.id);
+    const res  = await fetch(url, { mode:'cors' });
+    if(!res.ok) throw new Error('GAS '+res.status);
+    const data = await res.json();
+    if(!data.tracks) throw new Error('No tracks returned');
+    const {inserted} = await DB.batchPut(data.tracks, null);
+    await reload();
+    setStatus(`PULLED +${inserted} TRACKS FROM CLOUD`,'ok');
+    updateAccountPanel();
+  }catch(err){
+    setStatus('VAULT IS LOCAL — GAS SYNC OPTIONAL','err');
+    console.warn('Pull skipped:',err.message);
+  }
+}
+
+/* ── Push unsynced tracks to GAS ── */
+async function pushAllTracks(){
+  if(!currentUser) return;
+  const all      = await DB.getAll();
+  const unsynced = all.filter(t=>!t.synced);
+  if(!unsynced.length){ setStatus('ALL TRACKS SYNCED','ok'); return; }
+  setStatus(`SYNCING ${unsynced.length} TRACKS...`,'busy');
+  setSyncState('syncing');
+  try{
+    await gasCall({
+      action: 'batchAdd',
+      userId: currentUser.id,
+      tracks: unsynced.map(t=>({...t, thumb:t.thumb?.substring(0,500), data:undefined}))
+    });
+    for(const t of unsynced){ t.synced=true; await DB.put(t); }
+    setSyncState('synced');
+    setStatus(`SYNCED ${unsynced.length} TRACKS`,'ok');
+  }catch(err){
+    setSyncState('error');
+    setStatus('SYNC FAILED — SAVED LOCALLY','err');
+  }
+}
+
 
 /* ── Pull cloud tracks (GAS GET — works when GAS is properly deployed) ── */
 async function pullCloudTracks(){
